@@ -358,29 +358,34 @@ def _strip_code_fences(raw: str) -> str:
     return text.strip()
 
 
-def _parse_summarize_response(raw: str) -> list[dict[str, Any]]:
+def _parse_summarize_response(raw: str | dict) -> list[dict[str, Any]]:
     """Parse the LLM response from the summarization prompt."""
-    text = _strip_code_fences(raw)
-    try:
-        data = json.loads(text)
-        if isinstance(data, dict) and "files" in data:
-            result: list[dict[str, Any]] = data["files"]
-            return result
-        if isinstance(data, list):
-            return list(data)
-        logger.warning(
-            "Summarization response has unexpected structure (keys: %s): %s",
-            list(data.keys()) if isinstance(data, dict) else type(data).__name__,
-            text[:200],
-        )
-        return []
-    except (json.JSONDecodeError, TypeError) as exc:
-        logger.warning(
-            "Failed to parse summarization response (%s): %s",
-            exc,
-            raw[:300],
-        )
-        return []
+    # Handle dict input (some providers send already-parsed arguments)
+    if isinstance(raw, dict):
+        data = raw
+    else:
+        text = _strip_code_fences(raw)
+        try:
+            data = json.loads(text)
+        except (json.JSONDecodeError, TypeError) as exc:
+            logger.warning(
+                "Failed to parse summarization response (%s): %s",
+                exc,
+                str(raw)[:300],
+            )
+            return []
+
+    if isinstance(data, dict) and "files" in data:
+        result: list[dict[str, Any]] = data["files"]
+        return result
+    if isinstance(data, list):
+        return list(data)
+    logger.warning(
+        "Summarization response has unexpected structure (keys: %s): %s",
+        list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+        str(data)[:200],
+    )
+    return []
 
 
 def _build_file_summary(path: str, content: str, file_data: dict[str, Any]) -> FileSummary:
@@ -458,15 +463,20 @@ async def _summarize_batch(
             # Use the model's full output capacity instead of the default
             # 4096 — large batches were getting truncated mid-JSON
             # (`finish_reason: length` in OpenRouter logs).
+            from mira.llm.provider import SUBMIT_FILE_SUMMARIES_TOOL
             from mira.llm.registry import max_output_tokens
 
             cap = min(max_output_tokens(llm.config.model, default=16384), 32768)
-            raw = await llm.complete(
-                messages,
-                json_mode=True,
-                temperature=0.0,
-                max_tokens=cap,
-            )
+            saved_max_tokens = llm.config.max_tokens
+            llm.config.max_tokens = cap
+            try:
+                raw = await llm.complete_with_tools(
+                    messages,
+                    tools=[SUBMIT_FILE_SUMMARIES_TOOL],
+                    temperature=0.0,
+                )
+            finally:
+                llm.config.max_tokens = saved_max_tokens
         except Exception as exc:
             logger.warning("LLM summarization failed for batch of %d files: %s", len(files), exc)
             return []
@@ -860,11 +870,12 @@ async def _summarize_directories(
         ]
         async with semaphore:
             try:
-                raw = await llm.complete(
+                from mira.llm.provider import SUBMIT_DIRECTORY_SUMMARIES_TOOL
+
+                raw = await llm.complete_with_tools(
                     messages,
-                    json_mode=True,
+                    tools=[SUBMIT_DIRECTORY_SUMMARIES_TOOL],
                     temperature=0.0,
-                    max_tokens=4096,
                 )
                 data = json.loads(_strip_code_fences(raw))
             except Exception as exc:
@@ -1026,7 +1037,13 @@ async def _summarize_directories_selective(
 
         async with semaphore:
             try:
-                raw = await llm.complete(messages, json_mode=True, temperature=0.0)
+                from mira.llm.provider import SUBMIT_DIRECTORY_SUMMARY_TOOL
+
+                raw = await llm.complete_with_tools(
+                    messages,
+                    tools=[SUBMIT_DIRECTORY_SUMMARY_TOOL],
+                    temperature=0.0,
+                )
                 data = json.loads(_strip_code_fences(raw))
                 summary_text = data.get("summary", "")
                 if summary_text:

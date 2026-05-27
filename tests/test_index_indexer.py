@@ -150,7 +150,7 @@ class TestIndexRepo:
         store = IndexStore(str(tmp_path / "test.db"))
 
         mock_llm = AsyncMock()
-        mock_llm.complete = AsyncMock(
+        mock_llm.complete_with_tools = AsyncMock(
             return_value=json.dumps(
                 {
                     "files": [
@@ -216,7 +216,7 @@ class TestIndexDiff:
         store = IndexStore(str(tmp_path / "test.db"))
 
         mock_llm = AsyncMock()
-        mock_llm.complete = AsyncMock(
+        mock_llm.complete_with_tools = AsyncMock(
             return_value=json.dumps(
                 {
                     "files": [

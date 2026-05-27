@@ -276,6 +276,125 @@ SUBMIT_WALKTHROUGH_TOOL = {
 }
 
 
+# Tool schemas for indexing/summarization — use tool-calling instead of
+# response_format=json_object so it works reliably across all providers
+# (including MiniMax which ignores JSON mode).
+
+SUBMIT_FILE_SUMMARIES_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "submit_file_summaries",
+        "description": "Return structured summaries for a batch of source files.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "files": {
+                    "type": "array",
+                    "description": "One entry per file, with path, summary, symbols, imports, and external references.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Relative file path."},
+                            "summary": {"type": "string", "description": "One-paragraph summary of the file's purpose."},
+                            "language": {"type": "string"},
+                            "symbols": {
+                                "type": "array",
+                                "description": "Key functions/classes/consts exported by this file.",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "kind": {"type": "string"},
+                                        "signature": {"type": "string"},
+                                        "description": {"type": "string"},
+                                    },
+                                    "required": ["name", "kind"],
+                                },
+                            },
+                            "imports": {"type": "array", "items": {"type": "string"}},
+                            "external_refs": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "kind": {"type": "string"},
+                                        "target": {"type": "string"},
+                                        "description": {"type": "string"},
+                                    },
+                                },
+                            },
+                            "symbol_references": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "source": {"type": "string"},
+                                        "calls": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "path": {"type": "string"},
+                                                    "symbol": {"type": "string"},
+                                                },
+                                            },
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                        "required": ["path"],
+                    },
+                },
+            },
+            "required": ["files"],
+        },
+    },
+}
+
+
+SUBMIT_DIRECTORY_SUMMARIES_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "submit_directory_summaries",
+        "description": "Return summaries for a batch of directories.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "directories": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Directory path, or '(root)' for repo root."},
+                            "summary": {"type": "string", "description": "One-paragraph summary of the directory's purpose."},
+                        },
+                        "required": ["path", "summary"],
+                    },
+                },
+            },
+            "required": ["directories"],
+        },
+    },
+}
+
+
+SUBMIT_DIRECTORY_SUMMARY_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "submit_directory_summary",
+        "description": "Return a single directory summary.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string", "description": "One-paragraph summary of the directory's purpose."},
+            },
+            "required": ["summary"],
+        },
+    },
+}
+
+
 def _get_api_key(config: LLMConfig) -> str:
     """Resolve the API key for the configured endpoint.
 
@@ -303,10 +422,22 @@ def _get_api_key(config: LLMConfig) -> str:
 
 
 def _strip_model_prefix(model: str, base_url: str) -> str:
-    """Strip 'openrouter/' prefix only when targeting OpenRouter; other
-    endpoints accept (and often require) the full model string."""
-    if _is_openrouter(base_url) and model.startswith("openrouter/"):
-        return model[len("openrouter/") :]
+    """Strip provider prefixes that the target API doesn't accept.
+
+    OpenRouter accepts "provider/model" names as-is but prefers just
+    "model" — strip the "openrouter/" prefix for OpenRouter only.
+
+    Other OpenAI-compatible endpoints (MiniMax, Groq, Fireworks, etc.)
+    do NOT accept provider prefixes in model names — strip any
+    "provider/" prefix when the target is NOT OpenRouter.
+    """
+    if _is_openrouter(base_url):
+        if model.startswith("openrouter/"):
+            return model[len("openrouter/"):]
+        return model
+    # For all other endpoints, strip any "provider/" prefix.
+    if "/" in model:
+        return model.split("/", 1)[1]
     return model
 
 
@@ -430,7 +561,14 @@ class LLMProvider:
         tool_calls = message.get("tool_calls")
 
         if tool_calls and len(tool_calls) > 0:
-            return tool_calls[0]["function"]["arguments"]
+            arguments = tool_calls[0]["function"]["arguments"]
+            # Some providers (e.g. MiniMax) may return arguments as an
+            # already-parsed dict rather than a JSON string.
+            if isinstance(arguments, dict):
+                import json as _json
+
+                arguments = _json.dumps(arguments)
+            return arguments
 
         # Fallback: if the model returned content instead of a tool call,
         # return the content as-is (some models may not support tool calling)
