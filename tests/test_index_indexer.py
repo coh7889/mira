@@ -107,6 +107,42 @@ class TestStripCodeFences:
     def test_whitespace(self):
         assert _strip_code_fences('  ```json\n{"a": 1}\n```  ') == '{"a": 1}'
 
+    def test_chinese_think_double_newline(self):
+        """MiniMax output with double newlines between <think> and [/expand]."""
+        raw = '<think>\n\n[/expand]\n{"files": [{"path": "a.py", "summary": "Test"}]}'
+        result = _strip_code_fences(raw)
+        assert result == '{"files": [{"path": "a.py", "summary": "Test"}]}'
+
+    def test_chinese_think_single_newline(self):
+        """MiniMax output with single newline between <think> and [/expand]."""
+        raw = '<think>\n[/expand]\n{"files": []}'
+        result = _strip_code_fences(raw)
+        assert result == '{"files": []}'
+
+    def test_chinese_think_with_content(self):
+        """<think> with actual thinking content followed by [/expand]."""
+        raw = '<think>\nAnalyzing the codebase structure...\n[/expand]\n{"files": []}'
+        result = _strip_code_fences(raw)
+        assert result == '{"files": []}'
+
+    def test_chinese_think_unterminated(self):
+        """Input that starts with <think> but has no closing tag."""
+        raw = '<think>\nsome thinking'
+        result = _strip_code_fences(raw)
+        assert result == ''
+
+    def test_english_xml_think(self):
+        """English XML-style <thinking>...[/thinking] tags."""
+        raw = '<thinking>\nthinking\n[/thinking]\n{"files": []}'
+        result = _strip_code_fences(raw)
+        assert result == '{"files": []}'
+
+    def test_chinese_think_blank_line_after_expand(self):
+        """[/expand] followed by blank line before JSON."""
+        raw = '<think>\n[/expand]\n\n{"files": []}'
+        result = _strip_code_fences(raw)
+        assert result == '{"files": []}'
+
 
 class TestBuildFileSummary:
     def test_basic(self):

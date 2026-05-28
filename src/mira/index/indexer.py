@@ -353,6 +353,9 @@ def _strip_code_fences(raw: str) -> str:
     """
     text = raw.strip()
 
+    # Track if original input started with thinking tags (for fallback decision)
+    started_with_think = text.startswith("<think>") or text.startswith("<think")
+
     # 1. Strip markdown code fences
     if text.startswith("```"):
         first_newline = text.find("\n")
@@ -384,6 +387,29 @@ def _strip_code_fences(raw: str) -> str:
     text = re.sub(r"\[/thinking\]\s*$", "", text, flags=re.IGNORECASE | re.MULTILINE)
     # Strip [/expand] marker (if it appears after the thinking block was already stripped)
     text = re.sub(r"\[/expand\]", "", text, flags=re.IGNORECASE)
+
+    # 3. Final fallback: if text starts with <think> (Chinese), find first { and strip before it
+    # This handles cases where [/expand] wasn't found or the think block was truncated
+    if text.startswith("<think>"):
+        brace_pos = text.find("{")
+        if brace_pos > 0:
+            text = text[brace_pos:]
+        elif brace_pos == 0:
+            # JSON starts immediately after <think>, strip the think tag
+            close_pos = text.find("}")
+            if close_pos > 0:
+                text = text[close_pos + 1 :].strip()
+        else:
+            # No brace found - this is unterminated thinking content, return empty
+            text = ""
+    elif text.lstrip().startswith("{"):
+        # Text starts with { after stripping whitespace - valid JSON
+        text = text.lstrip()
+    elif started_with_think and text and not text.startswith("{"):
+        # Original input started with thinking tags, but after stripping we have
+        # non-JSON content. This means the think block was truncated. Return empty.
+        text = ""
+    # Otherwise: preserve original text (code fences, plain text like "hello", etc.)
 
     return text.strip()
 
