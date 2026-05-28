@@ -8,6 +8,7 @@ import io
 import json
 import logging
 import os
+import re
 import tarfile
 from collections.abc import Callable
 from fnmatch import fnmatch
@@ -345,16 +346,45 @@ async def _fetch_repo_tarball(
 
 
 def _strip_code_fences(raw: str) -> str:
-    """Strip markdown code fences (```json ... ```) from LLM output."""
+    """Strip markdown code fences and thinking tags from LLM output.
+
+    MiniMax and other thinking models prepend <thinking>...</thinking> blocks
+    around the actual JSON response. We strip these before parsing.
+    """
     text = raw.strip()
+
+    # 1. Strip markdown code fences
     if text.startswith("```"):
-        # Remove opening fence (```json or ```)
         first_newline = text.find("\n")
         if first_newline != -1:
             text = text[first_newline + 1 :]
-        # Remove closing fence
         if text.rstrip().endswith("```"):
             text = text.rstrip()[:-3]
+
+    # 2. Strip thinking tags (MiniMax and similar models)
+    # Strip <think>...[/expand] (the thinking block ends with [/expand] marker)
+    text = re.sub(r"<think>[\s\S]*?\[/expand\]", "", text, flags=re.IGNORECASE)
+    # If string starts with <thinking>...[/thinking] (English XML style), strip entire block
+    text = re.sub(
+        r"^<(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)\b[^>]*>[\s\S]*?\[/thinking\]\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    # Handle unterminated thinking tag at start (truncated by max_tokens):
+    # If content starts with <thinking> but [/expand] or [/thinking] never appears,
+    # strip everything from the opening tag through any content following it.
+    text = re.sub(
+        r"^<(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)\b[^>]*>\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    # Strip [/thinking] closing tag that appears AFTER the JSON output
+    text = re.sub(r"\[/thinking\]\s*$", "", text, flags=re.IGNORECASE | re.MULTILINE)
+    # Strip [/expand] marker (if it appears after the thinking block was already stripped)
+    text = re.sub(r"\[/expand\]", "", text, flags=re.IGNORECASE)
+
     return text.strip()
 
 
@@ -363,6 +393,13 @@ def _parse_summarize_response(raw: str) -> list[dict[str, Any]]:
     text = _strip_code_fences(raw)
     try:
         data = json.loads(text)
+        # If there's extra content after the JSON (e.g. thinking tags appended),
+        # json.loads succeeds on the first object but raises "Extra data".
+        # Guard against this by checking whether the raw text has more content
+        # after the parsed region and logging it.
+        remaining = raw[len(text.strip()):].strip()
+        if remaining:
+            logger.warning("Extra content after JSON (%d chars): %s", len(remaining), remaining[:200])
         if isinstance(data, dict) and "files" in data:
             result: list[dict[str, Any]] = data["files"]
             return result
@@ -375,10 +412,41 @@ def _parse_summarize_response(raw: str) -> list[dict[str, Any]]:
         )
         return []
     except (json.JSONDecodeError, TypeError) as exc:
+        err_msg = str(exc)
+        if "Extra data" in err_msg and text.startswith("{"):
+            # Extract character position from error message: "Extra data: line X column Y (char N)"
+            import re
+            m = re.search(r"\(char (\d+)\)", err_msg)
+            if m:
+                char_pos = int(m.group(1))
+                truncated = raw[:char_pos].strip()
+                if truncated.endswith("}"):
+                    try:
+                        data = json.loads(truncated)
+                        logger.warning("Recovered truncated JSON (%d chars from %d)", len(truncated), len(raw))
+                        if isinstance(data, dict) and "files" in data:
+                            return data["files"]
+                        if isinstance(data, list):
+                            return list(data)
+                    except Exception:
+                        pass
+            # Fallback: find the last '}' in text and try parsing up to there
+            last_brace = text.rfind("}")
+            if last_brace > 0:
+                truncated2 = text[:last_brace + 1]
+                try:
+                    data = json.loads(truncated2)
+                    logger.warning("Recovered via last brace (%d/%d chars)", last_brace + 1, len(text))
+                    if isinstance(data, dict) and "files" in data:
+                        return data["files"]
+                    if isinstance(data, list):
+                        return list(data)
+                except Exception:
+                    pass
         logger.warning(
             "Failed to parse summarization response (%s): %s",
             exc,
-            raw[:300],
+            raw[:1000],
         )
         return []
 
@@ -460,7 +528,7 @@ async def _summarize_batch(
             # (`finish_reason: length` in OpenRouter logs).
             from mira.llm.registry import max_output_tokens
 
-            cap = min(max_output_tokens(llm.config.model, default=16384), 32768)
+            cap = max_output_tokens(llm.config.model, default=4096)
             raw = await llm.complete(
                 messages,
                 json_mode=True,

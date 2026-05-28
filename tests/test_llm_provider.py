@@ -256,3 +256,166 @@ class TestUsageProperty:
         assert usage["prompt_tokens"] == 100
         assert usage["completion_tokens"] == 50
         assert usage["total_tokens"] == 150
+
+
+class TestMiniMaxProvider:
+    """Tests for MiniMax as an OpenAI-compatible provider."""
+
+    def test_minimax_base_url(self):
+        """MiniMax OpenAI-compatible endpoint is https://api.minimaxi.com/v1."""
+        config = LLMConfig(
+            model="minimax/m2.7",
+            base_url="https://api.minimaxi.com/v1",
+            api_key_env="MINIMAX_API_KEY",
+        )
+        provider = LLMProvider(config)
+        assert provider._chat_url() == "https://api.minimaxi.com/v1/chat/completions"
+
+    def test_minimax_api_key_resolution(self, monkeypatch: pytest.MonkeyPatch):
+        """MINIMAX_API_KEY is resolved correctly via api_key_env."""
+        monkeypatch.setenv("MINIMAX_API_KEY", "minimax-test-key-123")
+        config = LLMConfig(
+            model="minimax/m2.7",
+            base_url="https://api.minimaxi.com/v1",
+            api_key_env="MINIMAX_API_KEY",
+        )
+        from mira.llm.provider import _get_api_key
+
+        key = _get_api_key(config)
+        assert key == "minimax-test-key-123"
+
+    def test_minimax_not_openrouter(self):
+        """MiniMax base URL should not trigger OpenRouter-specific behavior."""
+        config = LLMConfig(
+            model="minimax/m2.7",
+            base_url="https://api.minimaxi.com/v1",
+            api_key_env="MINIMAX_API_KEY",
+        )
+        from mira.llm.provider import _is_openrouter
+
+        # MiniMax is NOT OpenRouter
+        assert _is_openrouter(config.base_url) is False
+
+    def test_minimax_strips_provider_prefix(self):
+        """MiniMax (non-OpenRouter) strips any 'provider/' prefix from model names.
+
+        The internal registry uses 'minimax/m2.7' but MiniMax API expects just 'm2.7'.
+        This is correct behavior - all non-OpenRouter endpoints strip provider prefixes.
+        """
+        from mira.llm.provider import _strip_model_prefix
+
+        # For non-OpenRouter endpoints, any "provider/" prefix is stripped
+        result = _strip_model_prefix("minimax/m2.7", "https://api.minimaxi.com/v1")
+        assert result == "m2.7"
+
+        # OpenRouter preserves provider prefix (openrouter/) but strips it when present
+        result = _strip_model_prefix("openrouter/anthropic/claude-sonnet-4-6", "https://openrouter.ai/api/v1")
+        assert result == "anthropic/claude-sonnet-4-6"
+
+    @pytest.mark.asyncio
+    async def test_minimax_completion_success(self, monkeypatch: pytest.MonkeyPatch):
+        """MiniMax completion works via OpenAI-compatible API."""
+        monkeypatch.setenv("MINIMAX_API_KEY", "minimax-test-key")
+        config = LLMConfig(
+            model="minimax/m2.7",
+            base_url="https://api.minimaxi.com/v1",
+            api_key_env="MINIMAX_API_KEY",
+        )
+        provider = LLMProvider(config)
+
+        mock_resp = _mock_httpx_response(
+            _make_response_json("MiniMax response content", {"prompt_tokens": 10, "completion_tokens": 8})
+        )
+
+        with patch("mira.llm.provider.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            result = await provider.complete([{"role": "user", "content": "hello"}])
+
+        assert result == "MiniMax response content"
+        assert provider.total_prompt_tokens == 10
+        assert provider.total_completion_tokens == 8
+
+    @pytest.mark.asyncio
+    async def test_minimax_headers_no_ranking_headers(self, monkeypatch: pytest.MonkeyPatch):
+        """MiniMax should NOT get OpenRouter-specific HTTP-Referer/X-Title headers."""
+        monkeypatch.setenv("MINIMAX_API_KEY", "minimax-test-key")
+        config = LLMConfig(
+            model="minimax/m2.7",
+            base_url="https://api.minimaxi.com/v1",
+            api_key_env="MINIMAX_API_KEY",
+        )
+        provider = LLMProvider(config)
+
+        mock_resp = _mock_httpx_response(_make_response_json("ok"))
+
+        with patch("mira.llm.provider.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            await provider.complete([{"role": "user", "content": "hi"}])
+
+            call_kwargs = mock_client.post.call_args
+            headers = call_kwargs.kwargs.get("headers") or call_kwargs[1].get("headers")
+            # MiniMax should NOT have OpenRouter-specific headers
+            assert "HTTP-Referer" not in headers
+            assert "X-Title" not in headers
+            # But should still have Authorization
+            assert "Authorization" in headers
+
+    @pytest.mark.asyncio
+    async def test_json_mode_fallback_hint_added(self, monkeypatch: pytest.MonkeyPatch):
+        """When json_mode_fallback=True, a JSON formatting hint is appended to the last message."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+        config = LLMConfig(model="test-model", json_mode_fallback=True)
+        provider = LLMProvider(config)
+
+        mock_resp = _mock_httpx_response(_make_response_json("{}"))
+
+        with patch("mira.llm.provider.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            messages = [{"role": "user", "content": "Return JSON"}]
+            await provider.complete(messages, json_mode=True)
+
+            call_kwargs = mock_client.post.call_args
+            body = call_kwargs.kwargs.get("json") or call_kwargs[1].get("json")
+            # The hint should be appended to the last message content
+            last_msg_content = body["messages"][-1]["content"]
+            assert "Respond with valid JSON only" in last_msg_content
+
+    @pytest.mark.asyncio
+    async def test_json_mode_fallback_disabled(self, monkeypatch: pytest.MonkeyPatch):
+        """When json_mode_fallback=False, no JSON hint is appended."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+        config = LLMConfig(model="test-model", json_mode_fallback=False)
+        provider = LLMProvider(config)
+
+        mock_resp = _mock_httpx_response(_make_response_json("{}"))
+
+        with patch("mira.llm.provider.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            messages = [{"role": "user", "content": "Return JSON"}]
+            await provider.complete(messages, json_mode=True)
+
+            call_kwargs = mock_client.post.call_args
+            body = call_kwargs.kwargs.get("json") or call_kwargs[1].get("json")
+            # The hint should NOT be appended
+            last_msg_content = body["messages"][-1]["content"]
+            assert "Respond with valid JSON only" not in last_msg_content
